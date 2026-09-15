@@ -279,9 +279,8 @@ jobs:
           # Inject ksu_resolved_hash into each device in the matrix
           merged_matrix=$(echo "$merged_matrix" | jq  --arg resolved_sha "$resolved_sha" 'map(.ksu_resolved_hash = $resolved_sha)')
           
-          # SUSFS hash fetch
-          SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
-          GITLAB_PROJECT_PATH="simonpunk/susfs4ksu"
+          # SUSFS hash & version fetch (GitHub Mirror)
+          SUSFS_GH_REPO="Star-Seven/susfs4ksu"
           
           declare -A default_branches=(
             ["android12-5.10"]="gki-android12-5.10"
@@ -305,7 +304,7 @@ jobs:
               | sort -u
           )
           
-          echo "🔍 Resolving SUSFS hashes for: ${active_keys[*]:-none}"
+          echo "🔍 Resolving SUSFS hashes from GitHub Mirror ($SUSFS_GH_REPO) for: ${active_keys[*]:-none}"
           
           declare -A susfs_hashes
           declare -A susfs_versions_per_key
@@ -314,44 +313,36 @@ jobs:
             default_val="${default_branches[$key]}"
             user_val="${user_inputs[$key]:-$default_val}"
             
-            # Build GraphQL query — include blob fetch only when releasing
-            HASH_QUERY="{ project(fullPath: \"${GITLAB_PROJECT_PATH}\") { repository { ch: commit(ref: \"${user_val}\") { sha } } } }"
-            RELEASE_QUERY="{ project(fullPath: \"${GITLAB_PROJECT_PATH}\") { repository { ch: commit(ref: \"${user_val}\") { sha } blobs(paths: [\"kernel_patches/include/linux/susfs.h\"], ref: \"${user_val}\") { nodes { rawBlob } } } } }"
-            
-            if [ "${{ inputs.make_release }}" = "true" ]; then
-              GL_QUERY="$RELEASE_QUERY"
+            resolved=""
+            if [[ "$user_val" =~ ^[0-9a-f]{40}$ ]]; then
+              resolved="$user_val"
             else
-              GL_QUERY="$HASH_QUERY"
+              resolved=$(gh api "repos/${SUSFS_GH_REPO}/commits/${user_val}" --jq '.sha' 2>/dev/null || true)
             fi
             
-            MAX_RETRIES=3
-            RETRY_COUNT=0
-            RETRY_DELAY=5
-            resolved=""
-            
-            until [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
-              RESPONSE=$(curl -s --fail -G "https://gitlab.com/api/graphql" --data-urlencode "query=$GL_QUERY")
-              EXIT_CODE=$?
+            if [ -n "$resolved" ] && [ "$resolved" != "null" ]; then
+              echo "  ✅ Query for $key Success: $resolved"
               
-              if [ $EXIT_CODE -eq 0 ] && [ -n "$RESPONSE" ]; then
-                resolved=$(echo "$RESPONSE" | jq -r '.data.project.repository.ch.sha // empty')
-                if [ -n "$resolved" ] && [ "$resolved" != "null" ]; then
-                  echo "  ✅ Query for $key Success"
-                  
-                  if [ "${{ inputs.make_release }}" = "true" ]; then
-                    extracted=$(echo "$RESPONSE" | jq -r '.data.project.repository.blobs.nodes[0].rawBlob // empty' | grep '#define SUSFS_VERSION' | awk -F'"' '{print $2}')
-                    susfs_versions_per_key[$key]="${extracted:-unknown}"
-                    echo "  ✅ $key → SUSFS_VERSION = ${extracted:-unknown}"
-                  fi
-                  
-                  break
-                fi
+              if [ "${{ inputs.make_release }}" = "true" ]; then
+                raw_header=$(curl -sSL "https://raw.githubusercontent.com/${SUSFS_GH_REPO}/${resolved}/kernel_patches/include/linux/susfs.h" 2>/dev/null || true)
+                extracted=$(echo "$raw_header" | grep '#define SUSFS_VERSION' | awk -F'"' '{print $2}')
+                susfs_versions_per_key[$key]="${extracted:-unknown}"
+                echo "  ✅ $key → SUSFS_VERSION = ${extracted:-unknown}"
               fi
-              
-              RETRY_COUNT=$((RETRY_COUNT + 1))
-              echo "::warning::GitLab GraphQL API failed (Attempt $RETRY_COUNT/$MAX_RETRIES). Retrying..."
-              sleep $RETRY_DELAY
-            done
+            else
+              echo "::error::Could not resolve SUSFS ref '$user_val' for $key on GitHub Mirror ($SUSFS_GH_REPO)."
+              exit 1
+            fi
+            
+            if [ "${{ inputs.make_release }}" = "true" ] && [ "${susfs_versions_per_key[$key]:-unknown}" = "unknown" ]; then
+              echo "::error::Could not extract SUSFS_VERSION from susfs.h for '$key'. Cannot proceed with release."
+              exit 1
+            fi
+            
+            susfs_hashes["$key"]="$resolved"
+            echo "  ✅ Resolved: $key → $resolved"
+          done
+
             
             # Final Validation — SUSFS hash
             if [ -z "$resolved" ] || [ "$resolved" = "null" ]; then
